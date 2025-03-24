@@ -134,7 +134,9 @@ def train(args):
                         writer.add_image('Images/Original', vutils.make_grid((images[:4].clamp(-1, 1) * 0.5 + 0.5), nrow=4), global_step)
                         writer.add_image('Images/Encrypted', vutils.make_grid((encrypted_images[:4].clamp(-1, 1) * 0.5 + 0.5), nrow=4), global_step)
                         writer.add_image('Images/Decrypted', vutils.make_grid((decrypted_images[:4].clamp(-1, 1) * 0.5 + 0.5), nrow=4), global_step)
-                        writer.add_image('Images/Masks', vutils.make_grid(masks[:4].unsqueeze(1).repeat(1, 3, 1, 1), nrow=4), global_step)
+                        # writer.add_image('Images/Masks', vutils.make_grid(masks[:4].unsqueeze(1).repeat(1, 3, 1, 1), nrow=4), global_step)
+                        writer.add_image('Images/Masks', vutils.make_grid(masks[:4].repeat(1, 3, 1, 1), nrow=4),
+                                         global_step)
                         
                         # Print metrics
                         print(f"\nStep {global_step} metrics:")
