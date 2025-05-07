@@ -43,6 +43,7 @@ def train(args):
     
     # Load checkpoint if specified
     start_epoch = 0
+    use_key_image = not args.use_gaussian_noise  # Default based on command line arg
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"Loading checkpoint from {args.resume}")
@@ -50,9 +51,27 @@ def train(args):
             diffusion_model.model.load_state_dict(checkpoint['model'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             start_epoch = checkpoint['epoch']
+            # Load encryption method choice if it exists in the checkpoint
+            if 'use_key_image' in checkpoint:
+                use_key_image = checkpoint['use_key_image']
+                print(f"Loaded encryption method: {'Key Image' if use_key_image else 'Gaussian Noise'}")
             print(f"Loaded checkpoint from epoch {start_epoch}")
         else:
             print(f"No checkpoint found at {args.resume}, starting from scratch")
+    
+    # If command line argument wasn't provided and not resuming from checkpoint, ask user
+    if not args.use_gaussian_noise and not args.resume:
+        user_input = input("Use key image for encryption? (y/n, default: y): ").lower().strip()
+        if user_input == 'n' or user_input == 'no':
+            use_key_image = False
+            print("Using Gaussian noise for encryption instead of key images")
+        else:
+            print("Using key images for encryption")
+    elif args.use_gaussian_noise:
+        use_key_image = False
+        print("Using Gaussian noise for encryption (from command line argument)")
+    else:
+        print(f"Using {'Key Image' if use_key_image else 'Gaussian Noise'} for encryption")
     
     # Create dataloader
     train_dataloader = get_dataloader(
@@ -70,7 +89,14 @@ def train(args):
         with tqdm(total=len(train_dataloader), desc=f"Epoch {epoch+1}/{args.epochs}") as pbar:
             for batch_idx, batch in enumerate(train_dataloader):
                 images = batch['image'].to(device)
-                keys = batch['key'].to(device)
+                original_keys = batch['key'].to(device)
+                
+                # If using Gaussian noise instead of key images
+                if not use_key_image:
+                    # Generate random Gaussian noise with same shape as keys
+                    keys = torch.randn_like(original_keys)
+                else:
+                    keys = original_keys
                 
                 # Detect ROIs for each image
                 batch_masks = []
@@ -163,6 +189,7 @@ def train(args):
             'model': diffusion_model.model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'loss': avg_loss,
+            'use_key_image': use_key_image,  # Save the encryption method choice
         }, checkpoint_path)
         print(f"Checkpoint saved to {checkpoint_path}")
     
@@ -190,6 +217,7 @@ if __name__ == "__main__":
     # Model parameters
     parser.add_argument('--encryption_timestep', type=int, default=500, help='Timestep to use for encryption during sampling')
     parser.add_argument('--yolo_confidence', type=float, default=0.25, help='Confidence threshold for YOLO ROI detection')
+    parser.add_argument('--use_gaussian_noise', action='store_true', help='Use Gaussian noise instead of key image for encryption')
     
     args = parser.parse_args()
     

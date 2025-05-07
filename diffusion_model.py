@@ -4,91 +4,181 @@ import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, use_bn=True):
+# ResNet-style Block for the hybrid architecture
+class ResNetBlock(nn.Module):
+    def __init__(self, channels, time_dim=None):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding)
-        self.bn = nn.BatchNorm2d(out_channels) if use_bn else nn.Identity()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(channels)
+        
+        # Time embedding projection if provided
+        self.time_mlp = nn.Linear(time_dim, channels) if time_dim is not None else None
+        
         self.activation = nn.SiLU()
         
-    def forward(self, x):
-        return self.activation(self.bn(self.conv(x)))
-
-class DownBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv1 = ConvBlock(in_channels, out_channels)
-        self.conv2 = ConvBlock(out_channels, out_channels)
-        self.pool = nn.MaxPool2d(2)
+    def forward(self, x, t_emb=None):
+        residual = x
         
-    def forward(self, x):
         x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.activation(x)
+        
+        # Add time embedding if provided
+        if t_emb is not None and self.time_mlp is not None:
+            time_emb = self.time_mlp(t_emb).unsqueeze(-1).unsqueeze(-1)
+            x = x + time_emb
+            
         x = self.conv2(x)
-        return self.pool(x), x
-
-class UpBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
-        self.conv1 = ConvBlock(in_channels + out_channels, out_channels)
-        self.conv2 = ConvBlock(out_channels, out_channels)
+        x = self.bn2(x)
         
-    def forward(self, x, skip):
-        x = self.up(x)
+        # Skip connection
+        x = x + residual
+        
+        return self.activation(x)
+
+# Attention Block for enhanced feature learning
+class SelfAttentionBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(channels, 4, batch_first=True)
+        self.ln = nn.LayerNorm([channels])
+        self.ff_self = nn.Sequential(
+            nn.LayerNorm([channels]),
+            nn.Linear(channels, channels),
+            nn.SiLU(),
+            nn.Linear(channels, channels),
+        )
+
+    def forward(self, x):
+        size = x.shape[-2:]
+        x = x.flatten(2).transpose(1, 2)
+        x_ln = self.ln(x)
+        attention_value, _ = self.mha(x_ln, x_ln, x_ln)
+        attention_value = attention_value + x
+        attention_value = self.ff_self(attention_value) + attention_value
+        return attention_value.transpose(1, 2).view(-1, attention_value.shape[-1], *size)
+
+# DownSample block that combines ResNet and UNet architectures
+class DownBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, time_dim=None, include_attention=False):
+        super().__init__()
+        self.res_block1 = ResNetBlock(in_channels, time_dim)
+        self.res_block2 = ResNetBlock(in_channels, time_dim)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, stride=2)
+        self.attention = SelfAttentionBlock(out_channels) if include_attention else nn.Identity()
+        
+    def forward(self, x, t_emb=None):
+        x = self.res_block1(x, t_emb)
+        skip = self.res_block2(x, t_emb)
+        x = self.conv(skip)
+        x = self.attention(x)
+        return x, skip
+
+# UpSample block that combines ResNet and UNet architectures
+class UpBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, time_dim=None, include_attention=False):
+        super().__init__()
+        self.res_block1 = ResNetBlock(in_channels + out_channels, time_dim)
+        self.res_block2 = ResNetBlock(in_channels + out_channels, time_dim)
+        self.upsample = nn.ConvTranspose2d(in_channels + out_channels, out_channels, kernel_size=4, stride=2, padding=1)
+        self.attention = SelfAttentionBlock(out_channels) if include_attention else nn.Identity()
+        
+    def forward(self, x, skip, t_emb=None):
         x = torch.cat([x, skip], dim=1)
-        x = self.conv1(x)
-        return self.conv2(x)
+        x = self.res_block1(x, t_emb)
+        x = self.res_block2(x, t_emb)
+        x = self.upsample(x)
+        x = self.attention(x)
+        return x
 
 class TimeEmbedding(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-        self.layer1 = nn.Linear(1, dim)
-        self.layer2 = nn.Linear(dim, dim)
+        
+        # Improved time embedding with sinusoidal positional encoding
+        half_dim = dim // 2
+        emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim) * -emb)
+        self.register_buffer("emb", emb)
+        
+        # MLP layers
+        self.projection1 = nn.Linear(dim, dim * 2)
+        self.projection2 = nn.Linear(dim * 2, dim)
         
     def forward(self, t):
         t = t.unsqueeze(-1).float()
-        t = self.layer1(t)
-        t = F.silu(t)
-        return self.layer2(t)
+        
+        # Create sinusoidal embedding
+        emb = t * self.emb
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+        
+        # Project to higher dimension and back
+        emb = self.projection1(emb)
+        emb = F.silu(emb)
+        emb = self.projection2(emb)
+        
+        return emb
 
-class UNet(nn.Module):
+# Improved UNet with ResNet blocks and attention mechanisms
+class ResNetUNet(nn.Module):
     def __init__(self, in_channels=3, key_channels=3, base_channels=64, time_dim=256):
         super().__init__()
         self.time_embedding = TimeEmbedding(time_dim)
         
-        # Initial convolution to incorporate key
+        # Key image processing path
         self.key_embed = nn.Sequential(
             nn.Conv2d(key_channels, base_channels, kernel_size=3, padding=1),
             nn.SiLU(),
+            ResNetBlock(base_channels),
             nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
             nn.SiLU()
         )
         
-        # Input convolution
-        self.inc = ConvBlock(in_channels, base_channels)
+        # Encrypted image processing path (for decryption)
+        self.encrypted_embed = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+            ResNetBlock(base_channels),
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
+            nn.SiLU()
+        )
+        
+        # Initial convolution
+        self.inc = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+            ResNetBlock(base_channels)
+        )
         
         # Downsampling path
-        self.down1 = DownBlock(base_channels, base_channels * 2)
-        self.down2 = DownBlock(base_channels * 2, base_channels * 4)
-        self.down3 = DownBlock(base_channels * 4, base_channels * 8)
+        self.down1 = DownBlock(base_channels, base_channels * 2, time_dim)
+        self.down2 = DownBlock(base_channels * 2, base_channels * 4, time_dim, include_attention=True)
+        self.down3 = DownBlock(base_channels * 4, base_channels * 8, time_dim)
         
         # Bottleneck
-        self.bottleneck1 = ConvBlock(base_channels * 8, base_channels * 16)
-        self.bottleneck2 = ConvBlock(base_channels * 16, base_channels * 8)
-        
-        # Time embedding projection
-        self.time_mlp1 = nn.Linear(time_dim, base_channels * 16)
+        self.bottleneck1 = ResNetBlock(base_channels * 8, time_dim)
+        self.bottleneck_attn = SelfAttentionBlock(base_channels * 8)
+        self.bottleneck2 = ResNetBlock(base_channels * 8, time_dim)
         
         # Upsampling path
-        self.up1 = UpBlock(base_channels * 8, base_channels * 4)
-        self.up2 = UpBlock(base_channels * 4, base_channels * 2)
-        self.up3 = UpBlock(base_channels * 2, base_channels)
+        self.up1 = UpBlock(base_channels * 8, base_channels * 4, time_dim)
+        self.up2 = UpBlock(base_channels * 4, base_channels * 2, time_dim, include_attention=True)
+        self.up3 = UpBlock(base_channels * 2, base_channels, time_dim)
+        
+        # Final processing
+        self.final_res = ResNetBlock(base_channels * 2, time_dim)
         
         # Output layer
-        self.outc = nn.Conv2d(base_channels, in_channels, kernel_size=1)
+        self.outc = nn.Sequential(
+            nn.Conv2d(base_channels * 2, base_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(base_channels, in_channels, kernel_size=1)
+        )
         
-    def forward(self, x, key, t):
+    def forward(self, x, key, t, encrypted_img=None):
         # Embed time step
         t_emb = self.time_embedding(t)
         
@@ -96,25 +186,36 @@ class UNet(nn.Module):
         key_features = self.key_embed(key)
         
         # Initial convolution
-        x = self.inc(x)
-        x = x + key_features  # Add key features
+        x_features = self.inc(x)
+        
+        # Combine with key features
+        x = x_features + key_features
+        
+        # If encrypted image is provided (during decryption), use it
+        if encrypted_img is not None:
+            encrypted_features = self.encrypted_embed(encrypted_img)
+            x = x + encrypted_features
         
         # Downsample
-        x1, skip1 = self.down1(x)
-        x2, skip2 = self.down2(x1)
-        x3, skip3 = self.down3(x2)
+        x1, skip1 = self.down1(x, t_emb)
+        x2, skip2 = self.down2(x1, t_emb)
+        x3, skip3 = self.down3(x2, t_emb)
         
-        # Bottleneck with time conditioning
-        x = self.bottleneck1(x3)
-        time_features = self.time_mlp1(t_emb).unsqueeze(-1).unsqueeze(-1)
-        x = x + time_features
-        x = self.bottleneck2(x)
-        
+        # Bottleneck with attention
+        x = self.bottleneck1(x3, t_emb)
+        x = self.bottleneck_attn(x)
+        x = self.bottleneck2(x, t_emb)
         
         # Upsample with skip connections
-        x = self.up1(x, skip3)
-        x = self.up2(x, skip2)
-        x = self.up3(x, skip1)
+        x = self.up1(x, skip3, t_emb)
+        x = self.up2(x, skip2, t_emb)
+        x = self.up3(x, skip1, t_emb)
+        
+        # Concatenate with initial features for better gradient flow
+        x = torch.cat([x, x_features], dim=1)
+        
+        # Final processing
+        x = self.final_res(x, t_emb)
         
         # Output
         return self.outc(x)
@@ -122,7 +223,7 @@ class UNet(nn.Module):
 class DiffusionModel:
     def __init__(self, device="cuda" if torch.cuda.is_available() else "cpu"):
         self.device = device
-        self.model = UNet().to(device)
+        self.model = ResNetUNet().to(device)
         
         # Define diffusion hyperparameters
         self.num_timesteps = 1000
@@ -153,14 +254,14 @@ class DiffusionModel:
         
         return sqrt_alphas_cumprod_t * x_0 + sqrt_one_minus_alphas_cumprod_t * noise
     
-    def p_sample(self, x_t, key, t, t_index):
+    def p_sample(self, x_t, key, t, t_index, orig_encrypted=None):
         """Sample from the reverse process"""
         betas_t = self.betas[t].view(-1, 1, 1, 1)
         sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
         sqrt_recip_alphas_t = self.sqrt_recip_alphas[t].view(-1, 1, 1, 1)
         
-        # Predict noise
-        predicted_noise = self.model(x_t, key, t)
+        # Predict noise using both current state and original encrypted image
+        predicted_noise = self.model(x_t, key, t, orig_encrypted)
         
         # No noise when t == 0
         noise = torch.randn_like(x_t) if t_index > 0 else torch.zeros_like(x_t)
@@ -208,7 +309,7 @@ class DiffusionModel:
     
     def decrypt(self, encrypted_image, key, t, mask=None, steps=None):
         """
-        Decrypt an image using the key
+        Decrypt an image using the key and the original encrypted image
         Args:
             encrypted_image: Encrypted image tensor (B, C, H, W)
             key: Key tensor (B, C, H, W)
@@ -227,85 +328,98 @@ class DiffusionModel:
         # Initialize x_t with the encrypted image
         x_t = encrypted_image.clone()
         
+        # Store original encrypted image for reference during decryption
+        orig_encrypted = encrypted_image.clone()
+        
         # For tracking intermediate steps
         intermediate_images = []
         
         # Get max steps to determine loop iterations
         max_steps = steps.max().item()
         
-        # Run denoising for specified steps
-        for i in tqdm(reversed(range(max_steps)), desc="Decrypting"):
-            # Create a time tensor with the current timestep
-            time_tensor = torch.ones(batch_size, device=self.device).long() * i
+        # Reverse diffusion process (denoising)
+        for i in tqdm(reversed(range(0, max_steps + 1)), desc="Decrypting", total=max_steps + 1):
+            # Get indices where current timestep is active
+            active_indices = (steps >= i).nonzero().squeeze(-1)
             
-            # Only update pixels for images where i < steps
-            mask_update = (i < steps).float().view(-1, 1, 1, 1)
+            if active_indices.shape[0] == 0:
+                continue
+                
+            # Get active batch items and their timesteps
+            active_t = torch.ones(active_indices.shape[0], device=self.device).long() * i
+            active_x_t = x_t[active_indices]
+            active_key = key[active_indices]
+            active_orig_encrypted = orig_encrypted[active_indices]
             
-            # Denoise step
-            with torch.no_grad():
-                denoised_image = self.p_sample(x_t, key, time_tensor, i)
+            # Sample from p(x_{t-1} | x_t, x_0)
+            pred_x_0 = self.p_sample(active_x_t, active_key, active_t, i, active_orig_encrypted)
             
-            # Update only relevant images
-            x_t = x_t * (1 - mask_update) + denoised_image * mask_update
+            # Update only active indices
+            x_t[active_indices] = pred_x_0
             
-            if i % (max_steps // 10) == 0 or i == max_steps - 1:
-                intermediate_images.append(x_t.clone())
-        
-        # If we have a mask, only replace the encrypted regions
-        if mask is not None:
-            mask = mask.to(self.device)
-            decrypted_image = encrypted_image * (1 - mask) + x_t * mask
-        else:
-            decrypted_image = x_t
+            # Apply mask if provided
+            if mask is not None:
+                active_mask = mask[active_indices]
+                # Only apply denoising to masked regions, keep original in unmasked regions
+                x_t[active_indices] = encrypted_image[active_indices] * (1 - active_mask) + pred_x_0 * active_mask
             
-        return decrypted_image, intermediate_images
-    
+            # Save intermediate for visualization (every 100 steps or last step)
+            if i % 100 == 0 or i == max_steps:
+                intermediate_images.append(x_t.detach().clone())
+                
+        return x_t, intermediate_images
+
     def train_step(self, image, key, optimizer, mask=None):
         """
-        Train the diffusion model for one step
+        Train the model for one step
         Args:
             image: Image tensor (B, C, H, W)
             key: Key tensor (B, C, H, W)
-            optimizer: PyTorch optimizer
-            mask: Optional mask tensor to only train on specific regions
+            optimizer: Optimizer to use
+            mask: Optional mask tensor (B, 1, H, W) for selective encryption
         """
         image = image.to(self.device)
         key = key.to(self.device)
         batch_size = image.shape[0]
         
-        optimizer.zero_grad()
+        # Choose random timesteps
+        t = torch.randint(0, self.num_timesteps, (batch_size,), device=self.device)
         
-        # Sample random timesteps
-        t = torch.randint(0, self.num_timesteps, (batch_size,), device=self.device).long()
-        
-        # Generate random noise
+        # Add noise to images
         noise = torch.randn_like(image)
+        noisy_images = self.q_sample(image, t, noise)
         
-        # Forward diffusion to get noisy image
-        noisy_image = self.q_sample(image, t, noise)
-        
-        # Predict noise
-        noise_pred = self.model(noisy_image, key, t)
-        
-        # Calculate loss
+        # Apply mask if provided
         if mask is not None:
             mask = mask.to(self.device)
-            # Only compute loss on masked regions
-            loss = F.mse_loss(noise_pred * mask, noise * mask) / (mask.mean() + 1e-8)
+            # Only add noise to masked regions for training
+            # The model should learn to denoise properly in those regions while leaving others untouched
+            target_images = image * (1 - mask) + noisy_images * mask
+            # For training, we want the model to predict what was added (full noise for masked regions, zero for others)
+            target_noise = noise * mask
         else:
-            loss = F.mse_loss(noise_pred, noise)
+            target_images = noisy_images
+            target_noise = noise
         
+        # Zero gradients
+        optimizer.zero_grad()
+        
+        # Forward pass
+        predicted_noise = self.model(noisy_images, key, t)
+        
+        # Calculate loss (mean squared error)
+        loss = F.mse_loss(predicted_noise, target_noise)
+        
+        # Backward pass and optimizer step
         loss.backward()
         optimizer.step()
         
         return loss.item()
     
     def save_model(self, path):
-        """Save model checkpoint"""
+        """Save model to path"""
         torch.save(self.model.state_dict(), path)
-    
+        
     def load_model(self, path):
-        """Load model from checkpoint"""
-        self.model.load_state_dict(torch.load(path, map_location=self.device))
-        self.model.to(self.device)
-        self.model.eval() 
+        """Load model from path"""
+        self.model.load_state_dict(torch.load(path, map_location=self.device)) 

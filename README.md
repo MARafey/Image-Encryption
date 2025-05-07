@@ -8,13 +8,38 @@ The core idea is to use a diffusion model as both an encryptor and decryptor for
 
 1. **Encryption**: An image is encrypted by adding noise to it according to a diffusion process guided by a key image.
 2. **ROI Detection**: YOLO model is used to detect regions of interest in the image that should be encrypted.
-3. **Decryption**: The same key image is used with the diffusion model to denoise/decrypt the encrypted image.
+3. **Decryption**: The same key image is used with the diffusion model to denoise/decrypt the encrypted image. The decryption process also leverages information from the encrypted image itself to improve reconstruction quality.
 
 This approach ensures that:
 
 - Only the correct key image can properly decrypt the image
 - Only specific regions of interest are encrypted, preserving the rest of the image
 - The encryption is robust and generates visually distorted encrypted regions
+- The decryption process is enhanced by utilizing both the key and encrypted image information
+
+## Advanced ResNet-UNet Hybrid Architecture
+
+The project features a state-of-the-art hybrid architecture that combines the strengths of ResNet and U-Net designs:
+
+### Key Components
+
+1. **ResNet Blocks**: Instead of standard convolutional blocks, we use residual blocks that preserve fine-grained information through skip connections, allowing better gradient flow during training and higher-quality reconstructions.
+
+2. **Self-Attention Mechanisms**: Strategic integration of attention modules at specific locations in the architecture allows the model to focus on relevant image regions, improving the encryption-decryption quality.
+
+3. **Enhanced Time Embedding**: Improved sinusoidal positional encoding for diffusion timesteps, inspired by transformer architectures, enhances the model's ability to understand the noise level during the diffusion process.
+
+4. **Bidirectional Feature Flow**: Features from both the upsampling and initial encoding paths are combined at the end, creating richer representations for final reconstruction.
+
+5. **Specialized Key and Encrypted Image Processing**: Dedicated paths for processing key images and encrypted content with residual connections for more effective feature extraction.
+
+### Advantages over Standard UNet
+
+- Improved stability during training with residual connections
+- Better preservation of high-frequency details in decrypted images
+- Enhanced ability to selectively encrypt/decrypt specific regions
+- More robust against adversarial attacks attempting to decode without the correct key
+- Higher structural similarity between original and decrypted images
 
 ## Installation
 
@@ -68,6 +93,7 @@ Additional options:
 --encryption_timestep: Timestep to use for encryption during sampling (default: 500)
 --yolo_confidence: Confidence threshold for YOLO ROI detection (default: 0.25)
 --no_cuda: Disable CUDA training
+--use_gaussian_noise: Use Gaussian noise instead of key image for encryption
 ```
 
 ### Inference
@@ -113,7 +139,13 @@ The following metrics are calculated and logged during training and inference:
 
 ### Core Components
 
-1. **Diffusion Model**: A UNet-based diffusion model that performs both encryption and decryption
+1. **ResNet-UNet Hybrid Model**: A state-of-the-art architecture that combines:
+
+   - **ResNet Blocks**: For improved gradient flow and feature preservation
+   - **Attention Mechanisms**: Strategically placed to focus on important regions
+   - **Enhanced Time Embedding**: Using sinusoidal positional encoding for better diffusion control
+   - **Bidirectional Feature Flow**: Combining features from different stages for better reconstruction
+
 2. **ROI Detector**: Uses YOLOv8 to detect regions of interest in images
 3. **Metrics**: Calculates quality metrics to evaluate the encryption and decryption performance
 4. **Dataset Loader**: Handles loading image and key pairs from the dataset
@@ -125,6 +157,8 @@ The encryption process follows a forward diffusion process where noise is gradua
 ### Decryption Process
 
 The decryption process reverses the diffusion process, gradually removing noise from the encrypted regions to recover the original image. This process requires the same key image used during encryption.
+
+The enhanced decryption algorithm also utilizes information from the encrypted image itself. By incorporating features extracted from the encrypted image during the denoising process, the model can better preserve important details and achieve higher quality reconstruction. This dual-input approach (key + encrypted image) makes the decryption more robust and effective, especially for complex images with fine details.
 
 ## License
 
