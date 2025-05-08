@@ -8,80 +8,77 @@ import os
 import argparse
 import zipfile
 import pandas as pd
-import requests
-from tqdm import tqdm
-from kaggle.api.kaggle_api_extended import KaggleApi
+import shutil
+import kagglehub
 
-def download_from_kaggle(output_dir):
+def download_from_kagglehub(output_dir):
     """
-    Download the HAM10000 dataset from Kaggle using the Kaggle API.
-    
-    Before running this, make sure to set up your Kaggle API credentials:
-    1. Go to kaggle.com -> Your Account -> Create New API Token
-    2. Save the kaggle.json file to ~/.kaggle/kaggle.json
-    3. Run `chmod 600 ~/.kaggle/kaggle.json` to secure the file
+    Download the HAM10000 dataset from Kaggle using kagglehub.
+    This is a simpler method than using the Kaggle API directly.
     """
-    print("Downloading HAM10000 dataset from Kaggle...")
+    print("Downloading HAM10000 dataset from Kaggle using kagglehub...")
     
-    # Initialize the Kaggle API
-    api = KaggleApi()
-    api.authenticate()
-    
-    # Create the output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Download the dataset
-    api.dataset_download_files(
-        dataset="kmader/skin-cancer-mnist-ham10000",
-        path=output_dir,
-        unzip=True,
-        quiet=False
-    )
-    
-    print(f"Dataset downloaded to {output_dir}")
-    return True
+    try:
+        # Download latest version of the dataset
+        path = kagglehub.dataset_download("kmader/skin-cancer-mnist-ham10000")
+        print(f"Dataset downloaded to: {path}")
+        
+        # Create the output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Check if the download was successful by looking for key files
+        if os.path.exists(path):
+            # Copy or move files to the user's specified output directory if different
+            if path != output_dir and not os.path.samefile(path, output_dir):
+                print(f"Copying files to user-specified directory: {output_dir}")
+                
+                # Copy files to output directory
+                for item in os.listdir(path):
+                    src_path = os.path.join(path, item)
+                    dst_path = os.path.join(output_dir, item)
+                    
+                    if os.path.isdir(src_path):
+                        if os.path.exists(dst_path):
+                            shutil.rmtree(dst_path)
+                        shutil.copytree(src_path, dst_path)
+                    else:
+                        shutil.copy2(src_path, dst_path)
+            
+            print(f"Dataset downloaded successfully to {output_dir}")
+            return True
+        else:
+            print("Failed to download dataset")
+            return False
+    except Exception as e:
+        print(f"Error downloading dataset with kagglehub: {str(e)}")
+        print("Falling back to alternative download method...")
+        return False
 
 def download_from_alternative(output_dir):
     """
     Alternative method to download the HAM10000 dataset from a direct URL.
     """
-    # URLs for the dataset files
-    urls = {
-        "HAM10000_metadata.csv": "https://storage.googleapis.com/kaggle-data-sets/122/83162/bundle/archive/HAM10000_metadata.csv?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=gcp-kaggle-com%40kaggle-161607.iam.gserviceaccount.com%2F20230101%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20230101T000000Z&X-Goog-Expires=259200&X-Goog-SignedHeaders=host&X-Goog-Signature=abcdefg",
-        "HAM10000_images.zip": "https://isic-challenge-data.s3.amazonaws.com/2018/ISIC2018_Task3_Training_Input.zip"
-    }
+    print("Please download the HAM10000 dataset manually from Kaggle:")
+    print("https://www.kaggle.com/datasets/kmader/skin-cancer-mnist-ham10000")
+    print("\nAfter downloading, extract the files to the output directory.")
+    print(f"Expected output directory: {output_dir}")
     
-    os.makedirs(output_dir, exist_ok=True)
-    
-    print("WARNING: Direct download URLs may not be stable. Kaggle API is recommended.")
-    print("Attempting to download HAM10000 dataset from alternative sources...")
-    
-    # Download metadata
-    try:
-        print("Please download the HAM10000 dataset manually from Kaggle:")
-        print("https://www.kaggle.com/datasets/kmader/skin-cancer-mnist-ham10000")
-        print("\nAfter downloading, extract the files to the output directory.")
-        print(f"Expected output directory: {output_dir}")
-        
-        manual_download = input("Press Enter once you've manually downloaded and extracted the dataset, or type 'skip' to skip: ")
-        if manual_download.lower() == 'skip':
-            return False
-            
-        # Check if files exist
-        if not os.path.exists(os.path.join(output_dir, 'HAM10000_metadata.csv')):
-            print("Error: Metadata file not found. Please make sure you've extracted the dataset correctly.")
-            return False
-            
-        images_dir = os.path.join(output_dir, 'HAM10000_images')
-        if not os.path.exists(images_dir) or len(os.listdir(images_dir)) < 1000:
-            print("Error: Image files not found or incomplete. Please make sure you've extracted the dataset correctly.")
-            return False
-            
-        print("Dataset files found!")
-        return True
-    except Exception as e:
-        print(f"Error downloading dataset: {str(e)}")
+    manual_download = input("Press Enter once you've manually downloaded and extracted the dataset, or type 'skip' to skip: ")
+    if manual_download.lower() == 'skip':
         return False
+        
+    # Check if files exist
+    if not os.path.exists(os.path.join(output_dir, 'HAM10000_metadata.csv')):
+        print("Error: Metadata file not found. Please make sure you've extracted the dataset correctly.")
+        return False
+        
+    images_dir = os.path.join(output_dir, 'HAM10000_images')
+    if not os.path.exists(images_dir) or len(os.listdir(images_dir)) < 1000:
+        print("Error: Image files not found or incomplete. Please make sure you've extracted the dataset correctly.")
+        return False
+        
+    print("Dataset files found!")
+    return True
 
 def verify_dataset(output_dir):
     """
@@ -166,12 +163,11 @@ def main():
     args = parser.parse_args()
     
     if not args.skip_download:
-        try:
-            # Try using Kaggle API first
-            success = download_from_kaggle(args.output_dir)
-        except Exception as e:
-            print(f"Error using Kaggle API: {str(e)}")
-            print("Falling back to alternative download method...")
+        # Try using kagglehub first
+        success = download_from_kagglehub(args.output_dir)
+        
+        if not success:
+            print("Falling back to manual download method...")
             success = download_from_alternative(args.output_dir)
         
         if not success:
