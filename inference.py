@@ -87,8 +87,16 @@ def run_inference(args):
     else:
         print("No model path provided, using randomly initialized model")
     
-    # Initialize ROI detector
-    roi_detector = ROIDetector(confidence=args.yolo_confidence, force_cpu=True, use_face_detection=True)
+    # Initialize ROI detector based on the segmentation method chosen
+    use_skin_lesion = args.use_skin_lesion_segmentation
+    roi_detector = ROIDetector(
+        confidence=args.yolo_confidence, 
+        force_cpu=True, 
+        use_face_detection=not use_skin_lesion,
+        use_skin_lesion_segmentation=use_skin_lesion
+    )
+    
+    print(f"Using {'skin lesion segmentation' if use_skin_lesion else 'YOLO face detection'} for ROI detection")
     
     # Define transform
     transform = transforms.Compose([
@@ -104,15 +112,25 @@ def run_inference(args):
     print(f"Loaded image from {args.image_path}")
     print(f"Loaded key from {args.key_path}")
     
-    # Detect ROIs
-    _, roi_coords = roi_detector.detect_rois(image[0].cpu())
-    
-    if not roi_coords:  # If no ROIs detected, use the entire image
-        print("No ROIs detected, using the entire image")
-        mask = torch.ones((image.shape[2], image.shape[3]), device=device)
+    # Detect ROIs based on the chosen segmentation method
+    if use_skin_lesion:
+        # For skin lesions, use detailed segmentation masks
+        detailed_mask = roi_detector.create_detailed_lesion_mask(image[0].cpu())
+        mask = detailed_mask.to(device)
+        
+        if mask.sum() < 10:  # If mask is too small/empty
+            print("Lesion segmentation produced too small ROI, using entire image")
+            mask = torch.ones((image.shape[2], image.shape[3]), device=device)
     else:
-        print(f"Detected {len(roi_coords)} ROIs")
-        mask = roi_detector.apply_rois_to_mask(image[0].shape, roi_coords)
+        # For general images, use bounding box detection
+        _, roi_coords = roi_detector.detect_rois(image[0].cpu())
+        
+        if not roi_coords:  # If no ROIs detected, use the entire image
+            print("No ROIs detected, using the entire image")
+            mask = torch.ones((image.shape[2], image.shape[3]), device=device)
+        else:
+            print(f"Detected {len(roi_coords)} ROIs")
+            mask = roi_detector.apply_rois_to_mask(image[0].shape, roi_coords)
     
     # Add batch and channel dimensions to mask
     mask = mask.unsqueeze(0).unsqueeze(0).to(device)
@@ -168,6 +186,8 @@ if __name__ == "__main__":
     parser.add_argument('--yolo_confidence', type=float, default=0.25, help='Confidence threshold for YOLO ROI detection')
     parser.add_argument('--no_cuda', action='store_true', help='Disable CUDA')
     parser.add_argument('--save_intermediates', action='store_true', help='Save intermediate decryption steps')
+    parser.add_argument('--use_skin_lesion_segmentation', action='store_true', 
+                       help='Use skin lesion segmentation instead of YOLO detection')
     
     args = parser.parse_args()
     

@@ -8,7 +8,7 @@ import torchvision.utils as vutils
 import numpy as np
 import matplotlib.pyplot as plt
 
-from dataset import get_dataloader
+from dataset import get_dataloader, get_ham10000_dataloaders
 from diffusion_model import DiffusionModel
 from roi_detector import ROIDetector
 from metrics import calculate_metrics
@@ -25,6 +25,10 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     print(f"Using device: {device}")
     
+    # Load checkpoint if specified
+    use_key_image = not args.use_gaussian_noise  # Default based on command line arg
+    start_epoch = 0
+    
     # Create checkpoint and samples directory
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     os.makedirs(args.samples_dir, exist_ok=True)
@@ -32,8 +36,15 @@ def train(args):
     # Setup TensorBoard
     writer = SummaryWriter(log_dir=args.log_dir)
     
-    # Initialize ROI detector
-    roi_detector = ROIDetector(confidence=args.yolo_confidence, force_cpu=True, use_face_detection=True)
+    # Initialize ROI detector based on dataset type
+    if args.dataset_type == 'ham10000':
+        roi_detector = ROIDetector(confidence=args.yolo_confidence, force_cpu=True, 
+                                  use_face_detection=False, use_skin_lesion_segmentation=True)
+        print("Using skin lesion segmentation for ROI detection")
+    else:
+        roi_detector = ROIDetector(confidence=args.yolo_confidence, force_cpu=True, 
+                                  use_face_detection=True)
+        print("Using face detection for ROI detection")
     
     # Initialize diffusion model
     diffusion_model = DiffusionModel(device=device)
@@ -41,9 +52,6 @@ def train(args):
     # Create optimizer
     optimizer = optim.Adam(diffusion_model.model.parameters(), lr=args.learning_rate)
     
-    # Load checkpoint if specified
-    start_epoch = 0
-    use_key_image = not args.use_gaussian_noise  # Default based on command line arg
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"Loading checkpoint from {args.resume}")
@@ -73,19 +81,33 @@ def train(args):
     else:
         print(f"Using {'Key Image' if use_key_image else 'Gaussian Noise'} for encryption")
     
-    # Create dataloader
-    train_dataloader = get_dataloader(
-        args.data_dir, 
-        batch_size=args.batch_size,
-        transform=None  # Use default transform in dataset.py
-    )
+    # Create dataloader based on dataset type
+    if args.dataset_type == 'ham10000':
+        print(f"Loading HAM10000 dataset from {args.data_dir}")
+        train_dataloader, val_dataloader, _ = get_ham10000_dataloaders(
+            args.data_dir, 
+            batch_size=args.batch_size,
+            use_same_keys=not use_key_image,  # If not using key images, generate fixed noise keys
+            transform=None  # Use default transform in dataset.py
+        )
+    else:
+        print(f"Loading standard dataset from {args.data_dir}")
+        train_dataloader = get_dataloader(
+            args.data_dir, 
+            batch_size=args.batch_size,
+            transform=None  # Use default transform in dataset.py
+        )
+        val_dataloader = None
     
     # Training loop
     global_step = start_epoch * len(train_dataloader)
+    best_val_loss = float('inf')
     
     for epoch in range(start_epoch, args.epochs):
         epoch_losses = []
         
+        # Training phase
+        diffusion_model.model.train()
         with tqdm(total=len(train_dataloader), desc=f"Epoch {epoch+1}/{args.epochs}") as pbar:
             for batch_idx, batch in enumerate(train_dataloader):
                 images = batch['image'].to(device)
@@ -98,24 +120,29 @@ def train(args):
                 else:
                     keys = original_keys
                 
-                # Detect ROIs for each image
+                # Detect ROIs for each image - use different approaches based on dataset
                 batch_masks = []
                 for i in range(images.shape[0]):
-                    _, roi_coords = roi_detector.detect_rois(images[i].cpu())
-                    
-                    if not roi_coords:  # If no ROIs detected, use the entire image
-                        mask = torch.ones((images.shape[2], images.shape[3]), device=device)
+                    if args.dataset_type == 'ham10000':
+                        # For skin lesions, use detailed segmentation masks
+                        mask = roi_detector.create_detailed_lesion_mask(images[i].cpu())
+                        mask = mask.unsqueeze(0).to(device)  # Add channel dimension
                     else:
-                        mask = roi_detector.apply_rois_to_mask(images[i].shape, roi_coords)
+                        # For general images, use bounding box detection
+                        _, roi_coords = roi_detector.detect_rois(images[i].cpu())
+                        
+                        if not roi_coords:  # If no ROIs detected, use the entire image
+                            mask = torch.ones((images.shape[2], images.shape[3]), device=device)
+                        else:
+                            mask = roi_detector.apply_rois_to_mask(images[i].shape, roi_coords)
+                        
+                        # Add channel dimension
+                        mask = mask.unsqueeze(0).to(device)
                     
-                    # Add channel dimension
-                    mask = mask.unsqueeze(0).to(device)
                     batch_masks.append(mask)
                 
                 # Stack masks along batch dimension
                 masks = torch.stack(batch_masks, dim=0)
-                
-                print(f"Masks shape: {masks.shape}")
                 
                 # Train step
                 loss = diffusion_model.train_step(images, keys, optimizer, masks)
@@ -156,13 +183,17 @@ def train(args):
                             nrow=4
                         )
                         
+                        # Save masks for visualization
+                        if masks.shape[1] == 1:  # If mask has channel dimension
+                            mask_display = masks[:4].repeat(1, 3, 1, 1)
+                        else:
+                            mask_display = masks[:4].unsqueeze(1).repeat(1, 3, 1, 1)
+                        
                         # Add images to tensorboard
                         writer.add_image('Images/Original', vutils.make_grid((images[:4].clamp(-1, 1) * 0.5 + 0.5), nrow=4), global_step)
                         writer.add_image('Images/Encrypted', vutils.make_grid((encrypted_images[:4].clamp(-1, 1) * 0.5 + 0.5), nrow=4), global_step)
                         writer.add_image('Images/Decrypted', vutils.make_grid((decrypted_images[:4].clamp(-1, 1) * 0.5 + 0.5), nrow=4), global_step)
-                        # writer.add_image('Images/Masks', vutils.make_grid(masks[:4].unsqueeze(1).repeat(1, 3, 1, 1), nrow=4), global_step)
-                        writer.add_image('Images/Masks', vutils.make_grid(masks[:4].repeat(1, 3, 1, 1), nrow=4),
-                                         global_step)
+                        writer.add_image('Images/Masks', vutils.make_grid(mask_display, nrow=4), global_step)
                         
                         # Print metrics
                         print(f"\nStep {global_step} metrics:")
@@ -177,6 +208,80 @@ def train(args):
                 pbar.update(1)
                 pbar.set_postfix({'loss': loss})
                 global_step += 1
+        
+        # Validation phase
+        if val_dataloader is not None:
+            diffusion_model.model.eval()
+            val_losses = []
+            
+            with torch.no_grad():
+                with tqdm(total=len(val_dataloader), desc="Validation") as pbar:
+                    for batch_idx, batch in enumerate(val_dataloader):
+                        images = batch['image'].to(device)
+                        original_keys = batch['key'].to(device)
+                        
+                        # If using Gaussian noise instead of key images
+                        if not use_key_image:
+                            # Generate random Gaussian noise with same shape as keys
+                            keys = torch.randn_like(original_keys)
+                        else:
+                            keys = original_keys
+                        
+                        # Detect ROIs for each image
+                        batch_masks = []
+                        for i in range(images.shape[0]):
+                            # For skin lesions, use detailed segmentation masks
+                            mask = roi_detector.create_detailed_lesion_mask(images[i].cpu())
+                            mask = mask.unsqueeze(0).to(device)  # Add channel dimension
+                            batch_masks.append(mask)
+                        
+                        # Stack masks along batch dimension
+                        masks = torch.stack(batch_masks, dim=0)
+                        
+                        # Compute batch_size random timesteps
+                        t = torch.randint(0, diffusion_model.num_timesteps, (images.shape[0],), device=device)
+                        
+                        # Add noise to images
+                        noise = torch.randn_like(images)
+                        noisy_images = diffusion_model.q_sample(images, t, noise)
+                        
+                        # Apply mask if provided
+                        if masks is not None:
+                            # Only add noise to masked regions for validation
+                            target_images = images * (1 - masks) + noisy_images * masks
+                            # For validation, we want the model to predict what was added (full noise for masked regions, zero for others)
+                            target_noise = noise * masks
+                        else:
+                            target_images = noisy_images
+                            target_noise = noise
+                        
+                        # Forward pass
+                        predicted_noise = diffusion_model.model(noisy_images, keys, t)
+                        
+                        # Calculate loss (mean squared error)
+                        val_loss = torch.nn.functional.mse_loss(predicted_noise, target_noise).item()
+                        val_losses.append(val_loss)
+                        
+                        pbar.update(1)
+                        pbar.set_postfix({'val_loss': val_loss})
+            
+            # Calculate average validation loss
+            avg_val_loss = np.mean(val_losses)
+            print(f"Validation loss: {avg_val_loss:.6f}")
+            writer.add_scalar('Loss/validation', avg_val_loss, epoch)
+            
+            # Save best model
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                best_model_path = os.path.join(args.checkpoint_dir, "best_model.pt")
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model': diffusion_model.model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'loss': best_val_loss,
+                    'use_key_image': use_key_image,
+                }, best_model_path)
+                print(f"Saved best model with validation loss: {best_val_loss:.6f}")
         
         # End of epoch, save checkpoint
         avg_loss = np.mean(epoch_losses)
@@ -218,6 +323,10 @@ if __name__ == "__main__":
     parser.add_argument('--encryption_timestep', type=int, default=500, help='Timestep to use for encryption during sampling')
     parser.add_argument('--yolo_confidence', type=float, default=0.25, help='Confidence threshold for YOLO ROI detection')
     parser.add_argument('--use_gaussian_noise', action='store_true', help='Use Gaussian noise instead of key image for encryption')
+    
+    # Dataset parameters
+    parser.add_argument('--dataset_type', type=str, choices=['standard', 'ham10000'], default='standard',
+                       help='Type of dataset to use (standard or HAM10000)')
     
     args = parser.parse_args()
     

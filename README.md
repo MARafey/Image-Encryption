@@ -7,7 +7,7 @@ This project implements a novel approach to image encryption and decryption usin
 The core idea is to use a diffusion model as both an encryptor and decryptor for images:
 
 1. **Encryption**: An image is encrypted by adding noise to it according to a diffusion process guided by a key image.
-2. **ROI Detection**: YOLO model is used to detect regions of interest in the image that should be encrypted.
+2. **ROI Detection**: YOLO model or specialized segmentation algorithms are used to detect regions of interest in the image that should be encrypted.
 3. **Decryption**: The same key image is used with the diffusion model to denoise/decrypt the encrypted image. The decryption process also leverages information from the encrypted image itself to improve reconstruction quality.
 
 This approach ensures that:
@@ -47,15 +47,17 @@ The project features a state-of-the-art hybrid architecture that combines the st
 pip install -r requirements.txt
 ```
 
-The project requires PyTorch, torchvision, ultralytics (for YOLO), and other dependencies listed in the requirements.txt file.
+The project requires PyTorch, torchvision, ultralytics (for YOLO), OpenCV, scikit-image, and other dependencies listed in the requirements.txt file.
 
 ### YOLO Model Download
 
 On first run, the system will automatically download the YOLOv8n model if not already present.
 
-## Dataset Structure
+## Supported Datasets
 
-The dataset should be organized in the following structure:
+### Standard Image Dataset
+
+For general purpose image encryption, the dataset should be organized in the following structure:
 
 ```
 dataset/
@@ -71,14 +73,43 @@ dataset/
 
 The key image for each image should be named with the prefix "key" followed by the image name. For example, the key for "image1.jpg" should be "keyimage1.jpg".
 
+### HAM10000 Skin Cancer Dataset
+
+The system also supports the HAM10000 skin cancer dataset, which can be downloaded from [Kaggle](https://www.kaggle.com/datasets/kmader/skin-cancer-mnist-ham10000).
+
+For this dataset, the system will:
+
+1. Automatically detect skin lesions using specialized image segmentation techniques
+2. Split the dataset into training, validation, and testing sets
+3. Either use other images as encryption keys or generate consistent noise patterns per diagnosis type
+
+The dataset structure should match the original HAM10000 format:
+
+```
+ham10000_dataset/
+  ├── HAM10000_metadata.csv
+  └── HAM10000_images/
+        ├── ISIC_0000000.jpg
+        ├── ISIC_0000001.jpg
+        └── ...
+```
+
 ## Usage
 
 ### Training
 
 To train the diffusion model for image encryption-decryption:
 
+#### With Standard Dataset
+
 ```bash
 python train.py --data_dir ./dataset --epochs 100 --batch_size 8
+```
+
+#### With HAM10000 Skin Cancer Dataset
+
+```bash
+python train.py --data_dir ./ham10000_dataset --epochs 100 --batch_size 8 --dataset_type ham10000
 ```
 
 Additional options:
@@ -94,6 +125,7 @@ Additional options:
 --yolo_confidence: Confidence threshold for YOLO ROI detection (default: 0.25)
 --no_cuda: Disable CUDA training
 --use_gaussian_noise: Use Gaussian noise instead of key image for encryption
+--dataset_type: Type of dataset to use, either 'standard' or 'ham10000' (default: standard)
 ```
 
 ### Inference
@@ -104,6 +136,12 @@ To encrypt and decrypt an image using a trained model:
 python inference.py --image_path path/to/image.jpg --key_path path/to/key.jpg --model_path path/to/model.pt
 ```
 
+For skin lesion images:
+
+```bash
+python inference.py --image_path path/to/lesion.jpg --key_path path/to/key.jpg --model_path path/to/model.pt --use_skin_lesion_segmentation
+```
+
 Additional options:
 
 ```
@@ -112,6 +150,7 @@ Additional options:
 --yolo_confidence: Confidence threshold for YOLO ROI detection (default: 0.25)
 --no_cuda: Disable CUDA
 --save_intermediates: Save intermediate decryption steps
+--use_skin_lesion_segmentation: Use skin lesion segmentation instead of YOLO detection
 ```
 
 ## Monitoring Training
@@ -122,7 +161,19 @@ You can monitor the training process using TensorBoard:
 tensorboard --logdir=./logs
 ```
 
-This will display training losses, metrics (MSE, PSNR, SSIM, Entropy), and sample images during training.
+This will display training losses, validation losses, metrics (MSE, PSNR, SSIM, Entropy), and sample images during training.
+
+## Skin Lesion Segmentation
+
+For the HAM10000 dataset, a specialized skin lesion segmentation approach is used:
+
+1. **Color Space Transformation**: Images are converted to LAB color space, which better separates skin lesions from surrounding skin.
+2. **Channel Extraction**: The A channel is extracted, which highlights redness and is particularly effective for lesion detection.
+3. **Adaptive Thresholding**: Otsu's method is used to automatically determine the optimal threshold for segmentation.
+4. **Morphological Operations**: Opening and dilation operations clean up the mask and ensure complete coverage of the lesion.
+5. **Contour Detection**: Contours are detected to find the precise boundary of the lesion.
+
+This approach provides more accurate ROI detection for skin lesions compared to general-purpose object detection models.
 
 ## Metrics
 
@@ -146,9 +197,14 @@ The following metrics are calculated and logged during training and inference:
    - **Enhanced Time Embedding**: Using sinusoidal positional encoding for better diffusion control
    - **Bidirectional Feature Flow**: Combining features from different stages for better reconstruction
 
-2. **ROI Detector**: Uses YOLOv8 to detect regions of interest in images
+2. **ROI Detectors**:
+
+   - **YOLO-based Detection**: Uses YOLOv8 to detect objects like faces in general images
+   - **Skin Lesion Segmentation**: Specialized algorithm for dermatological images that provides precise lesion boundaries
+
 3. **Metrics**: Calculates quality metrics to evaluate the encryption and decryption performance
-4. **Dataset Loader**: Handles loading image and key pairs from the dataset
+
+4. **Dataset Loader**: Handles multiple dataset types with appropriate train/val/test splits
 
 ### Encryption Process
 
