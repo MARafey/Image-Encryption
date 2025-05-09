@@ -42,6 +42,7 @@ class ResNetBlock(nn.Module):
 class SelfAttentionBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
+        self.channels = channels
         self.mha = nn.MultiheadAttention(channels, 4, batch_first=True)
         self.ln = nn.LayerNorm([channels])
         self.ff_self = nn.Sequential(
@@ -50,15 +51,36 @@ class SelfAttentionBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(channels, channels),
         )
+        # Size threshold for applying attention
+        self.max_size_threshold = 64 * 64  # Max spatial dimensions for safe attention
 
     def forward(self, x):
         size = x.shape[-2:]
-        x = x.flatten(2).transpose(1, 2)
-        x_ln = self.ln(x)
-        attention_value, _ = self.mha(x_ln, x_ln, x_ln)
-        attention_value = attention_value + x
-        attention_value = self.ff_self(attention_value) + attention_value
-        return attention_value.transpose(1, 2).view(-1, attention_value.shape[-1], *size)
+        batch_size = x.shape[0]
+        num_pixels = size[0] * size[1]
+        
+        # Skip attention for large feature maps to prevent OOM errors
+        if num_pixels > self.max_size_threshold:
+            # Print warning only once
+            if not hasattr(self, '_size_warned'):
+                print(f"Warning: Skipping attention for large tensor of shape {x.shape} to prevent OOM")
+                self._size_warned = True
+            return x  # Identity function
+            
+        try:
+            # Standard attention processing for smaller tensors
+            x_flat = x.flatten(2).transpose(1, 2)
+            x_ln = self.ln(x_flat)
+            attention_value, _ = self.mha(x_ln, x_ln, x_ln)
+            attention_value = attention_value + x_flat
+            attention_value = self.ff_self(attention_value) + attention_value
+            return attention_value.transpose(1, 2).view(batch_size, self.channels, *size)
+        except RuntimeError as e:
+            # Fallback when runtime error occurs (typically OOM)
+            if not hasattr(self, '_error_warned'):
+                print(f"Warning: Error in attention: {e}. Falling back to identity.")
+                self._error_warned = True
+            return x
 
 # DownSample block that combines ResNet and UNet architectures
 class DownBlock(nn.Module):
@@ -178,7 +200,8 @@ class ResNetUNet(nn.Module):
         # The first parameter should match the bottleneck output channels
         # The second parameter should match the corresponding skip connection channels
         self.up1 = UpBlock(base_channels * 8, base_channels * 4, time_dim)
-        self.up2 = UpBlock(base_channels * 4, base_channels * 2, time_dim, include_attention=True)
+        # Only use attention for smaller feature maps to avoid OOM
+        self.up2 = UpBlock(base_channels * 4, base_channels * 2, time_dim, include_attention=False)
         self.up3 = UpBlock(base_channels * 2, base_channels, time_dim)
         
         # Final processing
@@ -395,39 +418,90 @@ class DiffusionModel:
         key = key.to(self.device)
         batch_size = image.shape[0]
         
-        # Choose random timesteps
-        t = torch.randint(0, self.num_timesteps, (batch_size,), device=self.device)
-        
-        # Add noise to images
-        noise = torch.randn_like(image)
-        noisy_images = self.q_sample(image, t, noise)
-        
-        # Apply mask if provided
-        if mask is not None:
-            mask = mask.to(self.device)
-            # Only add noise to masked regions for training
-            # The model should learn to denoise properly in those regions while leaving others untouched
-            target_images = image * (1 - mask) + noisy_images * mask
-            # For training, we want the model to predict what was added (full noise for masked regions, zero for others)
-            target_noise = noise * mask
+        # Memory optimization for CPU training
+        if self.device == "cpu" and batch_size > 4:
+            # Process in smaller batches to save memory
+            max_sub_batch = 4  # Maximum sub-batch size for CPU
+            loss_sum = 0
+            
+            for i in range(0, batch_size, max_sub_batch):
+                end_idx = min(i + max_sub_batch, batch_size)
+                sub_batch_size = end_idx - i
+                
+                # Get sub-batch
+                image_sub = image[i:end_idx]
+                key_sub = key[i:end_idx]
+                mask_sub = mask[i:end_idx] if mask is not None else None
+                
+                # Choose random timesteps for this sub-batch
+                t_sub = torch.randint(0, self.num_timesteps, (sub_batch_size,), device=self.device)
+                
+                # Add noise to images
+                noise_sub = torch.randn_like(image_sub)
+                noisy_images_sub = self.q_sample(image_sub, t_sub, noise_sub)
+                
+                # Apply mask if provided
+                if mask_sub is not None:
+                    # Only add noise to masked regions for training
+                    target_images_sub = image_sub * (1 - mask_sub) + noisy_images_sub * mask_sub
+                    # For training, we want the model to predict what was added (full noise for masked regions, zero for others)
+                    target_noise_sub = noise_sub * mask_sub
+                else:
+                    target_images_sub = noisy_images_sub
+                    target_noise_sub = noise_sub
+                
+                # Zero gradients
+                optimizer.zero_grad()
+                
+                # Forward pass
+                predicted_noise_sub = self.model(noisy_images_sub, key_sub, t_sub)
+                
+                # Calculate loss (mean squared error)
+                loss_sub = F.mse_loss(predicted_noise_sub, target_noise_sub)
+                
+                # Backward pass and optimizer step
+                loss_sub.backward()
+                optimizer.step()
+                
+                loss_sum += loss_sub.item() * sub_batch_size
+            
+            # Average loss across all sub-batches
+            return loss_sum / batch_size
         else:
-            target_images = noisy_images
-            target_noise = noise
-        
-        # Zero gradients
-        optimizer.zero_grad()
-        
-        # Forward pass
-        predicted_noise = self.model(noisy_images, key, t)
-        
-        # Calculate loss (mean squared error)
-        loss = F.mse_loss(predicted_noise, target_noise)
-        
-        # Backward pass and optimizer step
-        loss.backward()
-        optimizer.step()
-        
-        return loss.item()
+            # Standard processing for GPU or small batches
+            # Choose random timesteps
+            t = torch.randint(0, self.num_timesteps, (batch_size,), device=self.device)
+            
+            # Add noise to images
+            noise = torch.randn_like(image)
+            noisy_images = self.q_sample(image, t, noise)
+            
+            # Apply mask if provided
+            if mask is not None:
+                mask = mask.to(self.device)
+                # Only add noise to masked regions for training
+                # The model should learn to denoise properly in those regions while leaving others untouched
+                target_images = image * (1 - mask) + noisy_images * mask
+                # For training, we want the model to predict what was added (full noise for masked regions, zero for others)
+                target_noise = noise * mask
+            else:
+                target_images = noisy_images
+                target_noise = noise
+            
+            # Zero gradients
+            optimizer.zero_grad()
+            
+            # Forward pass
+            predicted_noise = self.model(noisy_images, key, t)
+            
+            # Calculate loss (mean squared error)
+            loss = F.mse_loss(predicted_noise, target_noise)
+            
+            # Backward pass and optimizer step
+            loss.backward()
+            optimizer.step()
+            
+            return loss.item()
     
     def save_model(self, path):
         """Save model to path"""

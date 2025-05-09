@@ -22,8 +22,14 @@ def save_images(images, filename, nrow=4):
     
 def train(args):
     # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+    use_cuda = not args.no_cuda and torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
     print(f"Using device: {device}")
+    
+    # Set a smaller batch size if training on CPU
+    if device.type == 'cpu' and args.batch_size > 4:
+        print(f"Reducing batch size from {args.batch_size} to 4 for CPU training")
+        args.batch_size = 4
     
     # Load checkpoint if specified
     use_key_image = not args.use_gaussian_noise  # Default based on command line arg
