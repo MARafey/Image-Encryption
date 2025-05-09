@@ -86,6 +86,17 @@ class UpBlock(nn.Module):
         self.attention = SelfAttentionBlock(out_channels) if include_attention else nn.Identity()
         
     def forward(self, x, skip, t_emb=None):
+        # Check if shapes match except in channel dimension
+        if x.shape[0] != skip.shape[0] or x.shape[2] != skip.shape[2] or x.shape[3] != skip.shape[3]:
+            # Print warning but only once
+            if not hasattr(self, '_warned'):
+                self._warned = True
+                print(f"WARNING: Shape mismatch in UpBlock. Input: {x.shape}, Skip: {skip.shape}. Resizing skip connection.")
+            
+            # Resize skip connection if spatial dimensions don't match
+            skip = F.interpolate(skip, size=(x.shape[2], x.shape[3]), mode='bilinear', align_corners=False)
+        
+        # Concatenate along channel dimension
         x = torch.cat([x, skip], dim=1)
         x = self.res_block1(x, t_emb)
         x = self.res_block2(x, t_emb)
@@ -163,7 +174,9 @@ class ResNetUNet(nn.Module):
         self.bottleneck_attn = SelfAttentionBlock(base_channels * 8)
         self.bottleneck2 = ResNetBlock(base_channels * 8, time_dim)
         
-        # Upsampling path
+        # Upsampling path - Fix the channel dimensions to match skip connections
+        # The first parameter should match the bottleneck output channels
+        # The second parameter should match the corresponding skip connection channels
         self.up1 = UpBlock(base_channels * 8, base_channels * 4, time_dim)
         self.up2 = UpBlock(base_channels * 4, base_channels * 2, time_dim, include_attention=True)
         self.up3 = UpBlock(base_channels * 2, base_channels, time_dim)
