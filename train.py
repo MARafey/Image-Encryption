@@ -44,9 +44,8 @@ def train(args):
     
     # Initialize ROI detector based on dataset type
     if args.dataset_type == 'ham10000':
-        roi_detector = ROIDetector(confidence=args.yolo_confidence, force_cpu=True, 
-                                  use_face_detection=False, use_skin_lesion_segmentation=True)
-        print("Using skin lesion segmentation for ROI detection")
+        roi_detector = None  # No ROI detection needed for HAM10000
+        print("Using full image encryption for HAM10000 dataset")
     else:
         roi_detector = ROIDetector(confidence=args.yolo_confidence, force_cpu=True, 
                                   use_face_detection=True)
@@ -130,9 +129,9 @@ def train(args):
                 batch_masks = []
                 for i in range(images.shape[0]):
                     if args.dataset_type == 'ham10000':
-                        # For skin lesions, use detailed segmentation masks
-                        mask = roi_detector.create_detailed_lesion_mask(images[i].cpu())
-                        mask = mask.unsqueeze(0).to(device)  # Add channel dimension
+                        # For HAM10000, use full image encryption
+                        mask = torch.ones((images.shape[2], images.shape[3]), device=device)
+                        mask = mask.unsqueeze(0)  # Add channel dimension
                     else:
                         # For general images, use bounding box detection
                         _, roi_coords = roi_detector.detect_rois(images[i].cpu())
