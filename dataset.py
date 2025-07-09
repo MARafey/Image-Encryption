@@ -7,6 +7,36 @@ from PIL import Image
 from torchvision import transforms
 import random
 
+def create_transforms(use_augmentation=False):
+    """
+    Create training transforms with optional data augmentation
+    Args:
+        use_augmentation: Whether to apply data augmentation
+    Returns:
+        torchvision.transforms.Compose object
+    """
+    if use_augmentation:
+        # Data augmentation for training
+        transform = transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.2),
+            transforms.RandomRotation(degrees=15),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+    else:
+        # Standard transforms without augmentation
+        transform = transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+    
+    return transform
+
 class EncryptionDataset(Dataset):
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
@@ -79,7 +109,7 @@ class HAM10000Dataset(Dataset):
             if os.path.exists(img_path):
                 self.image_paths.append(img_path)
             else:
-                print(f"Warning: Image {img_id} not found")
+                print(f"Warning: Image {img_path} not found")
         
         self.transform = transform or transforms.Compose([
             transforms.Resize((256, 256)),
@@ -131,21 +161,81 @@ class HAM10000Dataset(Dataset):
             if self.transform:
                 key = self.transform(key)
         
+        # Process metadata for model conditioning
+        age = img_meta.get('age', 0.0)
+        if pd.isna(age):
+            age = 0.0
+        # Normalize age to 0-1 range (assuming max age around 100)
+        normalized_age = min(age / 100.0, 1.0)
+        
+        sex = img_meta.get('sex', 'unknown')
+        if pd.isna(sex):
+            sex = 'unknown'
+            
+        localization = img_meta.get('localization', 'unknown')
+        if pd.isna(localization):
+            localization = 'unknown'
+            
+        dx_type_method = img_meta.get('dx_type', 'unknown')
+        if pd.isna(dx_type_method):
+            dx_type_method = 'unknown'
+        
         return {
             'image': image, 
             'key': key, 
             'image_path': img_path, 
             'dx_type': dx_type,
             'lesion_id': img_meta['lesion_id'],
-            'dx_id': img_meta.get('dx_type', -1)  # Some versions have different column names
+            'dx_id': img_meta.get('dx_type', -1),  # Some versions have different column names
+            # Medical metadata for conditioning
+            'metadata': {
+                'dx': dx_type,
+                'dx_type': dx_type_method,
+                'age': normalized_age,
+                'sex': sex,
+                'localization': localization
+            }
         }
 
-def get_dataloader(root_dir, batch_size=8, shuffle=True, transform=None):
+def get_dataloader(root_dir, batch_size=8, shuffle=True, transform=None, use_augmentation=False):
+    if transform is None:
+        transform = create_transforms(use_augmentation)
     dataset = EncryptionDataset(root_dir, transform)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=4)
     return dataloader
 
-def get_ham10000_dataloaders(data_dir, batch_size=8, transform=None, use_same_keys=False, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15):
+def collate_metadata(batch):
+    """
+    Collate function to properly handle metadata in batches
+    """
+    # Extract individual components
+    images = torch.stack([item['image'] for item in batch])
+    keys = torch.stack([item['key'] for item in batch])
+    
+    # Extract metadata into separate lists
+    metadata = {
+        'dx': [item['metadata']['dx'] for item in batch],
+        'dx_type': [item['metadata']['dx_type'] for item in batch],
+        'age': torch.tensor([item['metadata']['age'] for item in batch], dtype=torch.float32),
+        'sex': [item['metadata']['sex'] for item in batch],
+        'localization': [item['metadata']['localization'] for item in batch]
+    }
+    
+    # Other fields
+    image_paths = [item['image_path'] for item in batch]
+    dx_types = [item['dx_type'] for item in batch]
+    lesion_ids = [item['lesion_id'] for item in batch]
+    
+    return {
+        'image': images,
+        'key': keys,
+        'image_path': image_paths,
+        'dx_type': dx_types,
+        'lesion_id': lesion_ids,
+        'metadata': metadata
+    }
+
+def get_ham10000_dataloaders(data_dir, batch_size=8, transform=None, use_same_keys=False, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, use_metadata_collate=True, use_augmentation=False):
     """
     Create train, validation, and test dataloaders for HAM10000 dataset
     Args:
@@ -156,33 +246,58 @@ def get_ham10000_dataloaders(data_dir, batch_size=8, transform=None, use_same_ke
         train_ratio: Proportion of data to use for training
         val_ratio: Proportion of data to use for validation
         test_ratio: Proportion of data to use for testing
+        use_metadata_collate: Whether to use custom collate function for metadata
+        use_augmentation: Whether to apply data augmentation to training data
     Returns:
         train_loader, val_loader, test_loader
     """
     # Ensure ratios sum to 1
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-5, "Ratios must sum to 1"
     
-    # Create the dataset
-    dataset = HAM10000Dataset(data_dir, transform=transform, use_same_keys=use_same_keys)
+    # Create transforms if not provided
+    if transform is None:
+        # Use augmentation for training, no augmentation for validation/test
+        train_transform = create_transforms(use_augmentation)
+        val_transform = create_transforms(use_augmentation=False)
+    else:
+        train_transform = transform
+        val_transform = transform
+    
+    # Create separate datasets for each split with appropriate transforms
+    train_dataset_full = HAM10000Dataset(data_dir, transform=train_transform, use_same_keys=use_same_keys)
+    val_dataset_full = HAM10000Dataset(data_dir, transform=val_transform, use_same_keys=use_same_keys)
+    test_dataset_full = HAM10000Dataset(data_dir, transform=val_transform, use_same_keys=use_same_keys)
     
     # Calculate split sizes
-    total_size = len(dataset)
+    total_size = len(train_dataset_full)
     train_size = int(train_ratio * total_size)
     val_size = int(val_ratio * total_size)
     test_size = total_size - train_size - val_size
     
-    # Split the dataset
-    train_dataset, val_dataset, test_dataset = random_split(
-        dataset, 
-        [train_size, val_size, test_size],
-        generator=torch.Generator().manual_seed(42)  # For reproducible splits
-    )
+    # Get indices for splitting
+    indices = list(range(total_size))
+    random.Random(42).shuffle(indices)  # For reproducible splits
+    
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:train_size + val_size]
+    test_indices = indices[train_size + val_size:]
+    
+    # Create subset datasets
+    from torch.utils.data import Subset
+    train_dataset = Subset(train_dataset_full, train_indices)
+    val_dataset = Subset(val_dataset_full, val_indices)
+    test_dataset = Subset(test_dataset_full, test_indices)
+    
+    # Choose collate function
+    collate_fn = collate_metadata if use_metadata_collate else None
     
     # Create dataloaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn)
     
     print(f"Dataset split: {train_size} training, {val_size} validation, {test_size} test samples")
+    if use_augmentation:
+        print("Data augmentation enabled for training data")
     
     return train_loader, val_loader, test_loader 

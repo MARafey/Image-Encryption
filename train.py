@@ -51,11 +51,29 @@ def train(args):
                                   use_face_detection=True)
         print("Using face detection for ROI detection")
     
-    # Initialize diffusion model
-    diffusion_model = DiffusionModel(device=device)
+    # Initialize diffusion model with dropout
+    diffusion_model = DiffusionModel(device=device, dropout_rate=args.dropout_rate)
     
-    # Create optimizer
-    optimizer = optim.Adam(diffusion_model.model.parameters(), lr=args.learning_rate)
+    # Create optimizer with weight decay
+    optimizer = optim.Adam(diffusion_model.model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    
+    # Create learning rate scheduler
+    scheduler = None
+    if args.lr_scheduler == 'cosine':
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+        print(f"Using Cosine Annealing LR scheduler")
+    elif args.lr_scheduler == 'step':
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
+        print(f"Using Step LR scheduler (step_size=100, gamma=0.5)")
+    
+    # Print regularization settings
+    print(f"Regularization techniques enabled:")
+    print(f"  - Weight decay (L2): {args.weight_decay}")
+    print(f"  - Dropout rate: {args.dropout_rate}")
+    print(f"  - Batch normalization: Enabled")
+    print(f"  - Data augmentation: {'Enabled' if args.use_data_augmentation else 'Disabled'}")
+    print(f"  - Learning rate scheduling: {args.lr_scheduler}")
+    print(f"  - Skip connections: Enabled")
     
     if args.resume:
         if os.path.isfile(args.resume):
@@ -64,6 +82,9 @@ def train(args):
             diffusion_model.model.load_state_dict(checkpoint['model'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             start_epoch = checkpoint['epoch']
+            # Load scheduler state if it exists
+            if scheduler is not None and 'scheduler' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler'])
             # Load encryption method choice if it exists in the checkpoint
             if 'use_key_image' in checkpoint:
                 use_key_image = checkpoint['use_key_image']
@@ -74,7 +95,7 @@ def train(args):
     
     # If command line argument wasn't provided and not resuming from checkpoint, ask user
     if not args.use_gaussian_noise and not args.resume:
-        user_input = input("Use key image for encryption? (y/n, default: y): ").lower().strip()
+        user_input = 'n' #input("Use key image for encryption? (y/n, default: y): ").lower().strip()
         if user_input == 'n' or user_input == 'no':
             use_key_image = False
             print("Using Gaussian noise for encryption instead of key images")
@@ -93,14 +114,14 @@ def train(args):
             args.data_dir, 
             batch_size=args.batch_size,
             use_same_keys=not use_key_image,  # If not using key images, generate fixed noise keys
-            transform=None  # Use default transform in dataset.py
+            use_augmentation=args.use_data_augmentation
         )
     else:
         print(f"Loading standard dataset from {args.data_dir}")
         train_dataloader = get_dataloader(
             args.data_dir, 
             batch_size=args.batch_size,
-            transform=None  # Use default transform in dataset.py
+            use_augmentation=args.use_data_augmentation
         )
         val_dataloader = None
     
@@ -232,12 +253,17 @@ def train(args):
                         else:
                             keys = original_keys
                         
-                        # Detect ROIs for each image
+                        # Detect ROIs for each image - use different approaches based on dataset
                         batch_masks = []
                         for i in range(images.shape[0]):
-                            # For skin lesions, use detailed segmentation masks
-                            mask = roi_detector.create_detailed_lesion_mask(images[i].cpu())
-                            mask = mask.unsqueeze(0).to(device)  # Add channel dimension
+                            if args.dataset_type == 'ham10000':
+                                # For HAM10000, use full image encryption
+                                mask = torch.ones((images.shape[2], images.shape[3]), device=device)
+                                mask = mask.unsqueeze(0)  # Add channel dimension
+                            else:
+                                # For general images, use detailed lesion segmentation
+                                mask = roi_detector.create_detailed_lesion_mask(images[i].cpu())
+                                mask = mask.unsqueeze(0).to(device)  # Add channel dimension
                             batch_masks.append(mask)
                         
                         # Stack masks along batch dimension
@@ -279,29 +305,43 @@ def train(args):
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 best_model_path = os.path.join(args.checkpoint_dir, "best_model.pt")
-                torch.save({
+                best_checkpoint_data = {
                     'epoch': epoch + 1,
                     'model': diffusion_model.model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'loss': best_val_loss,
                     'use_key_image': use_key_image,
-                }, best_model_path)
+                }
+                if scheduler is not None:
+                    best_checkpoint_data['scheduler'] = scheduler.state_dict()
+                torch.save(best_checkpoint_data, best_model_path)
                 print(f"Saved best model with validation loss: {best_val_loss:.6f}")
         
         # End of epoch, save checkpoint
         avg_loss = np.mean(epoch_losses)
         print(f"Epoch {epoch+1} average loss: {avg_loss:.6f}")
         
+        # Step learning rate scheduler
+        if scheduler is not None:
+            scheduler.step()
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"Learning rate: {current_lr:.6f}")
+            writer.add_scalar('Learning_Rate', current_lr, epoch)
+        
         # Save checkpoint
         checkpoint_path = os.path.join(args.checkpoint_dir, f"model_epoch{epoch+1}.pt")
-        torch.save({
-            'epoch': epoch + 1,
-            'model': diffusion_model.model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'loss': avg_loss,
-            'use_key_image': use_key_image,  # Save the encryption method choice
-        }, checkpoint_path)
-        print(f"Checkpoint saved to {checkpoint_path}")
+        if epoch % 10 == 0:
+            checkpoint_data = {
+                'epoch': epoch + 1,
+                'model': diffusion_model.model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'loss': avg_loss,
+                'use_key_image': use_key_image,  # Save the encryption method choice
+            }
+            if scheduler is not None:
+                checkpoint_data['scheduler'] = scheduler.state_dict()
+            torch.save(checkpoint_data, checkpoint_path)
+            print(f"Checkpoint saved to {checkpoint_path}")
     
     # Close tensorboard writer
     writer.close()
@@ -315,17 +355,21 @@ if __name__ == "__main__":
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints', help='Directory to save model checkpoints')
     parser.add_argument('--samples_dir', type=str, default='./samples', help='Directory to save sample images')
     parser.add_argument('--log_dir', type=str, default='./logs', help='Directory for tensorboard logs')
-    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume training from')
+    parser.add_argument('--resume', type=str, default='checkpoints/model_epoch111.pt', help='Path to checkpoint to resume training from')
     
     # Training parameters
-    parser.add_argument('--epochs', type=int, default=100, help='Number of epochs to train')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training')
+    parser.add_argument('--epochs', type=int, default=1000, help='Number of epochs to train')
+    parser.add_argument('--batch_size', type=int, default=2, help='Batch size for training')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--sample_interval', type=int, default=100, help='Interval for generating and saving samples')
+    parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay (L2 regularization)')
+    parser.add_argument('--dropout_rate', type=float, default=0.2, help='Dropout rate for regularization')
+    parser.add_argument('--use_data_augmentation', action='store_true', help='Enable data augmentation')
+    parser.add_argument('--lr_scheduler', type=str, choices=['cosine', 'step', 'none'], default='cosine', help='Learning rate scheduler type')
+    parser.add_argument('--sample_interval', type=int, default=1000, help='Interval for generating and saving samples')
     parser.add_argument('--no_cuda', action='store_true', help='Disable CUDA training')
     
     # Model parameters
-    parser.add_argument('--encryption_timestep', type=int, default=500, help='Timestep to use for encryption during sampling')
+    parser.add_argument('--encryption_timestep', type=int, default=400, help='Timestep to use for encryption during sampling')
     parser.add_argument('--yolo_confidence', type=float, default=0.25, help='Confidence threshold for YOLO ROI detection')
     parser.add_argument('--use_gaussian_noise', action='store_true', help='Use Gaussian noise instead of key image for encryption')
     
@@ -335,4 +379,5 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    train(args) 
+    train(args)
+    

@@ -155,11 +155,118 @@ class TimeEmbedding(nn.Module):
         
         return emb
 
+# Metadata Embedding for medical information conditioning
+class MetadataEmbedding(nn.Module):
+    def __init__(self, dim=256):
+        super().__init__()
+        
+        # Diagnosis embedding (7 main types)
+        self.dx_embedding = nn.Embedding(10, dim // 4)  # Extra space for unknown types
+        
+        # Diagnosis type embedding (4 main types)
+        self.dx_type_embedding = nn.Embedding(5, dim // 8)
+        
+        # Age embedding (normalized to 0-1 range)
+        self.age_projection = nn.Linear(1, dim // 8)
+        
+        # Sex embedding (male=0, female=1, unknown=2)
+        self.sex_embedding = nn.Embedding(3, dim // 8)
+        
+        # Body location embedding (12+ main locations)
+        self.location_embedding = nn.Embedding(15, dim // 4)
+        
+        # Final projection to combine all embeddings
+        self.final_projection = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.SiLU(),
+            nn.Linear(dim * 2, dim),
+            nn.LayerNorm(dim)
+        )
+        
+        # Diagnosis type mapping
+        self.dx_mapping = {
+            'mel': 0, 'nv': 1, 'bcc': 2, 'akiec': 3, 'bkl': 4, 'df': 5, 'vasc': 6
+        }
+        
+        # Diagnosis method mapping
+        self.dx_type_mapping = {
+            'histo': 0, 'follow_up': 1, 'consensus': 2, 'confocal': 3
+        }
+        
+        # Sex mapping
+        self.sex_mapping = {'male': 0, 'female': 1}
+        
+        # Body location mapping
+        self.location_mapping = {
+            'face': 0, 'scalp': 1, 'ear': 2, 'back': 3, 'trunk': 4, 'chest': 5,
+            'upper extremity': 6, 'lower extremity': 7, 'abdomen': 8, 'neck': 9,
+            'genital': 10, 'foot': 11, 'hand': 12, 'acral': 13, 'unknown': 14
+        }
+    
+    def forward(self, metadata_dict):
+        """
+        metadata_dict should contain:
+        - dx: list of diagnosis strings
+        - dx_type: list of diagnosis type strings  
+        - age: tensor of ages (normalized 0-1)
+        - sex: list of sex strings
+        - localization: list of body location strings
+        """
+        batch_size = len(metadata_dict['dx'])
+        device = next(self.parameters()).device
+        
+        # Convert diagnosis to indices
+        dx_indices = torch.tensor([
+            self.dx_mapping.get(dx.lower(), 7) for dx in metadata_dict['dx']
+        ], device=device)
+        dx_emb = self.dx_embedding(dx_indices)
+        
+        # Convert diagnosis type to indices
+        dx_type_indices = torch.tensor([
+            self.dx_type_mapping.get(dx_type.lower(), 4) for dx_type in metadata_dict['dx_type']
+        ], device=device)
+        dx_type_emb = self.dx_type_embedding(dx_type_indices)
+        
+        # Age embedding (already normalized)
+        age_emb = self.age_projection(metadata_dict['age'].unsqueeze(1).to(device))
+        
+        # Sex embedding
+        sex_indices = torch.tensor([
+            self.sex_mapping.get(sex.lower(), 2) for sex in metadata_dict['sex']
+        ], device=device)
+        sex_emb = self.sex_embedding(sex_indices)
+        
+        # Location embedding
+        loc_indices = torch.tensor([
+            self.location_mapping.get(loc.lower(), 14) for loc in metadata_dict['localization']
+        ], device=device)
+        loc_emb = self.location_embedding(loc_indices)
+        
+        # Concatenate all embeddings
+        combined = torch.cat([dx_emb, dx_type_emb, age_emb, sex_emb, loc_emb], dim=1)
+        
+        # Final projection
+        metadata_embedding = self.final_projection(combined)
+        
+        return metadata_embedding
+
 # Improved UNet with ResNet blocks and attention mechanisms
 class ResNetUNet(nn.Module):
-    def __init__(self, in_channels=3, key_channels=3, base_channels=64, time_dim=256):
+    def __init__(self, in_channels=3, key_channels=3, base_channels=64, time_dim=256, use_metadata=True, dropout_rate=0.1):
         super().__init__()
         self.time_embedding = TimeEmbedding(time_dim)
+        self.use_metadata = use_metadata
+        self.dropout_rate = dropout_rate
+        
+        # Metadata embedding for conditioning
+        if use_metadata:
+            self.metadata_embedding = MetadataEmbedding(time_dim)
+            # Fusion layer for time and metadata
+            self.time_metadata_fusion = nn.Sequential(
+                nn.Linear(time_dim * 2, time_dim * 2),
+                nn.SiLU(),
+                nn.Linear(time_dim * 2, time_dim)
+            )
         
         # Key image processing path
         self.key_embed = nn.Sequential(
@@ -194,6 +301,7 @@ class ResNetUNet(nn.Module):
         # Bottleneck
         self.bottleneck1 = ResNetBlock(base_channels * 8, time_dim)
         self.bottleneck_attn = SelfAttentionBlock(base_channels * 8)
+        self.bottleneck_dropout = nn.Dropout2d(dropout_rate)
         self.bottleneck2 = ResNetBlock(base_channels * 8, time_dim)
         
         # Upsampling path - Fix the channel dimensions to match skip connections
@@ -206,17 +314,26 @@ class ResNetUNet(nn.Module):
         
         # Final processing
         self.final_res = ResNetBlock(base_channels * 2, time_dim)
+        self.final_dropout = nn.Dropout2d(dropout_rate)
         
         # Output layer
         self.outc = nn.Sequential(
             nn.Conv2d(base_channels * 2, base_channels, kernel_size=3, padding=1),
             nn.SiLU(),
+            nn.Dropout2d(dropout_rate),
             nn.Conv2d(base_channels, in_channels, kernel_size=1)
         )
         
-    def forward(self, x, key, t, encrypted_img=None):
+    def forward(self, x, key, t, encrypted_img=None, metadata=None):
         # Embed time step
         t_emb = self.time_embedding(t)
+        
+        # Add metadata conditioning if available
+        if self.use_metadata and metadata is not None:
+            metadata_emb = self.metadata_embedding(metadata)
+            # Fuse time and metadata embeddings
+            combined_emb = torch.cat([t_emb, metadata_emb], dim=1)
+            t_emb = self.time_metadata_fusion(combined_emb)
         
         # Process key
         key_features = self.key_embed(key)
@@ -240,6 +357,7 @@ class ResNetUNet(nn.Module):
         # Bottleneck with attention
         x = self.bottleneck1(x3, t_emb)
         x = self.bottleneck_attn(x)
+        x = self.bottleneck_dropout(x)
         x = self.bottleneck2(x, t_emb)
         
         # Upsample with skip connections
@@ -252,14 +370,16 @@ class ResNetUNet(nn.Module):
         
         # Final processing
         x = self.final_res(x, t_emb)
+        x = self.final_dropout(x)
         
         # Output
         return self.outc(x)
 
 class DiffusionModel:
-    def __init__(self, device="cuda" if torch.cuda.is_available() else "cpu"):
+    def __init__(self, device="cuda" if torch.cuda.is_available() else "cpu", use_metadata=True, dropout_rate=0.1):
         self.device = device
-        self.model = ResNetUNet().to(device)
+        self.use_metadata = use_metadata
+        self.model = ResNetUNet(use_metadata=use_metadata, dropout_rate=dropout_rate).to(device)
         
         # Define diffusion hyperparameters
         self.num_timesteps = 1000
@@ -290,14 +410,14 @@ class DiffusionModel:
         
         return sqrt_alphas_cumprod_t * x_0 + sqrt_one_minus_alphas_cumprod_t * noise
     
-    def p_sample(self, x_t, key, t, t_index, orig_encrypted=None):
+    def p_sample(self, x_t, key, t, t_index, orig_encrypted=None, metadata=None):
         """Sample from the reverse process"""
         betas_t = self.betas[t].view(-1, 1, 1, 1)
         sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
         sqrt_recip_alphas_t = self.sqrt_recip_alphas[t].view(-1, 1, 1, 1)
         
         # Predict noise using both current state and original encrypted image
-        predicted_noise = self.model(x_t, key, t, orig_encrypted)
+        predicted_noise = self.model(x_t, key, t, orig_encrypted, metadata)
         
         # No noise when t == 0
         noise = torch.randn_like(x_t) if t_index > 0 else torch.zeros_like(x_t)
@@ -343,7 +463,7 @@ class DiffusionModel:
             
         return encrypted_image, t
     
-    def decrypt(self, encrypted_image, key, t, mask=None, steps=None):
+    def decrypt(self, encrypted_image, key, t, mask=None, steps=None, metadata=None):
         """
         Decrypt an image using the key and the original encrypted image
         Args:
@@ -352,6 +472,7 @@ class DiffusionModel:
             t: Timestep used for encryption (B,)
             mask: Optional mask tensor (B, 1, H, W) to only decrypt specific regions
             steps: Number of denoising steps (default: timestep value)
+            metadata: Optional metadata dict with medical information for conditioning
         """
         encrypted_image = encrypted_image.to(self.device)
         key = key.to(self.device)
@@ -388,7 +509,17 @@ class DiffusionModel:
             active_orig_encrypted = orig_encrypted[active_indices]
             
             # Sample from p(x_{t-1} | x_t, x_0)
-            pred_x_0 = self.p_sample(active_x_t, active_key, active_t, i, active_orig_encrypted)
+            # Extract metadata for active indices if provided
+            active_metadata = None
+            if metadata is not None:
+                active_metadata = {}
+                for key_meta in metadata:
+                    if isinstance(metadata[key_meta], list):
+                        active_metadata[key_meta] = [metadata[key_meta][idx] for idx in active_indices]
+                    else:  # tensor
+                        active_metadata[key_meta] = metadata[key_meta][active_indices]
+            
+            pred_x_0 = self.p_sample(active_x_t, active_key, active_t, i, active_orig_encrypted, active_metadata)
             
             # Update only active indices
             x_t[active_indices] = pred_x_0
@@ -405,7 +536,7 @@ class DiffusionModel:
                 
         return x_t, intermediate_images
 
-    def train_step(self, image, key, optimizer, mask=None):
+    def train_step(self, image, key, optimizer, mask=None, metadata=None):
         """
         Train the model for one step
         Args:
@@ -413,6 +544,7 @@ class DiffusionModel:
             key: Key tensor (B, C, H, W)
             optimizer: Optimizer to use
             mask: Optional mask tensor (B, 1, H, W) for selective encryption
+            metadata: Optional metadata dict with medical information for conditioning
         """
         image = image.to(self.device)
         key = key.to(self.device)
@@ -454,7 +586,17 @@ class DiffusionModel:
                 optimizer.zero_grad()
                 
                 # Forward pass
-                predicted_noise_sub = self.model(noisy_images_sub, key_sub, t_sub)
+                # Extract metadata for sub-batch if provided
+                sub_metadata = None
+                if metadata is not None:
+                    sub_metadata = {}
+                    for key_meta in metadata:
+                        if isinstance(metadata[key_meta], list):
+                            sub_metadata[key_meta] = metadata[key_meta][i:end_idx]
+                        else:  # tensor
+                            sub_metadata[key_meta] = metadata[key_meta][i:end_idx]
+                
+                predicted_noise_sub = self.model(noisy_images_sub, key_sub, t_sub, None, sub_metadata)
                 
                 # Calculate loss (mean squared error)
                 loss_sub = F.mse_loss(predicted_noise_sub, target_noise_sub)
@@ -492,7 +634,7 @@ class DiffusionModel:
             optimizer.zero_grad()
             
             # Forward pass
-            predicted_noise = self.model(noisy_images, key, t)
+            predicted_noise = self.model(noisy_images, key, t, None, metadata)
             
             # Calculate loss (mean squared error)
             loss = F.mse_loss(predicted_noise, target_noise)

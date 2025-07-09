@@ -142,7 +142,8 @@ def prepare_dataset(output_dir):
     for dx, count in dx_counts.items():
         print(f"  {dx}: {count} images ({count/len(metadata)*100:.1f}%)")
     
-    # Check image paths
+    # image paths 'ham10000_dataset' has folder moving all images in folder to a single folder name 'images'
+    print(output_dir)
     images_dir = os.path.join(output_dir, 'HAM10000_images')
     if not os.path.exists(images_dir):
         images_dir = os.path.join(output_dir, 'images')
@@ -174,11 +175,11 @@ def main():
             print("Dataset download failed. Please try downloading manually from Kaggle.")
             return
     
-    # Verify the dataset
-    print("\nVerifying dataset integrity...")
-    if not verify_dataset(args.output_dir):
-        print("Dataset verification failed. Please check the error messages above.")
-        return
+    # # Verify the dataset
+    # print("\nVerifying dataset integrity...")
+    # if not verify_dataset(args.output_dir):
+    #     print("Dataset verification failed. Please check the error messages above.")
+    #     return
     
     # Prepare the dataset
     print("\nPreparing dataset for use with the model...")
