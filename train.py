@@ -52,7 +52,12 @@ def train(args):
         print("Using face detection for ROI detection")
     
     # Initialize diffusion model with dropout
-    diffusion_model = DiffusionModel(device=device, dropout_rate=args.dropout_rate)
+    diffusion_model = DiffusionModel(
+        device=device, 
+        dropout_rate=args.dropout_rate,
+        use_enhanced_loss=args.use_enhanced_loss,
+        beta_schedule=args.beta_schedule
+    )
     
     # Create optimizer with weight decay
     optimizer = optim.Adam(diffusion_model.model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -372,6 +377,8 @@ if __name__ == "__main__":
     parser.add_argument('--encryption_timestep', type=int, default=400, help='Timestep to use for encryption during sampling')
     parser.add_argument('--yolo_confidence', type=float, default=0.25, help='Confidence threshold for YOLO ROI detection')
     parser.add_argument('--use_gaussian_noise', action='store_true', help='Use Gaussian noise instead of key image for encryption')
+    parser.add_argument('--use_enhanced_loss', action='store_true', help='Use enhanced loss function (MSE + Perceptual + SSIM + Gradient)')
+    parser.add_argument('--beta_schedule', type=str, choices=['linear', 'cosine'], default='cosine', help='Beta schedule for diffusion model')
     
     # Dataset parameters
     parser.add_argument('--dataset_type', type=str, choices=['standard', 'ham10000'], default='standard',

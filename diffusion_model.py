@@ -3,6 +3,153 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
+import torchvision.models as models
+
+# Enhanced loss function for better reconstruction
+class EnhancedLoss(nn.Module):
+    def __init__(self, device='cuda', lambda_perceptual=0.1, lambda_ssim=0.1, lambda_gradient=0.05):
+        super().__init__()
+        self.device = device
+        self.lambda_perceptual = lambda_perceptual
+        self.lambda_ssim = lambda_ssim
+        self.lambda_gradient = lambda_gradient
+        
+        # VGG for perceptual loss
+        self.vgg = models.vgg19(pretrained=True).features[:16].to(device)
+        for param in self.vgg.parameters():
+            param.requires_grad = False
+        self.vgg.eval()
+        
+        # Normalization for VGG
+        self.vgg_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+        self.vgg_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+        
+    def vgg_preprocess(self, x):
+        # Convert from [-1, 1] to [0, 1]
+        x = (x + 1) / 2
+        # Normalize for VGG
+        x = (x - self.vgg_mean) / self.vgg_std
+        return x
+    
+    def perceptual_loss(self, pred, target):
+        pred_vgg = self.vgg(self.vgg_preprocess(pred))
+        target_vgg = self.vgg(self.vgg_preprocess(target))
+        return F.mse_loss(pred_vgg, target_vgg)
+    
+    def ssim_loss(self, pred, target):
+        # Simple SSIM loss implementation
+        mu1 = F.avg_pool2d(pred, 3, 1, 1)
+        mu2 = F.avg_pool2d(target, 3, 1, 1)
+        mu1_mu2 = mu1 * mu2
+        mu1_sq = mu1 * mu1
+        mu2_sq = mu2 * mu2
+        
+        sigma1_sq = F.avg_pool2d(pred * pred, 3, 1, 1) - mu1_sq
+        sigma2_sq = F.avg_pool2d(target * target, 3, 1, 1) - mu2_sq
+        sigma12 = F.avg_pool2d(pred * target, 3, 1, 1) - mu1_mu2
+        
+        C1 = 0.01 ** 2
+        C2 = 0.03 ** 2
+        
+        ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+        return 1 - ssim_map.mean()
+    
+    def gradient_loss(self, pred, target):
+        # Gradient loss for sharper edges
+        pred_grad_x = torch.abs(pred[:, :, :, :-1] - pred[:, :, :, 1:])
+        pred_grad_y = torch.abs(pred[:, :, :-1, :] - pred[:, :, 1:, :])
+        target_grad_x = torch.abs(target[:, :, :, :-1] - target[:, :, :, 1:])
+        target_grad_y = torch.abs(target[:, :, :-1, :] - target[:, :, 1:, :])
+        
+        grad_loss_x = F.mse_loss(pred_grad_x, target_grad_x)
+        grad_loss_y = F.mse_loss(pred_grad_y, target_grad_y)
+        
+        return grad_loss_x + grad_loss_y
+    
+    def forward(self, predicted_noise, target_noise, pred_image=None, target_image=None):
+        # Primary MSE loss for noise prediction
+        mse_loss = F.mse_loss(predicted_noise, target_noise)
+        
+        total_loss = mse_loss
+        
+        # Add perceptual and structural losses if images are provided
+        if pred_image is not None and target_image is not None:
+            # Perceptual loss
+            perceptual = self.perceptual_loss(pred_image, target_image)
+            total_loss += self.lambda_perceptual * perceptual
+            
+            # SSIM loss
+            ssim = self.ssim_loss(pred_image, target_image)
+            total_loss += self.lambda_ssim * ssim
+            
+            # Gradient loss
+            gradient = self.gradient_loss(pred_image, target_image)
+            total_loss += self.lambda_gradient * gradient
+        
+        return total_loss
+
+# Feature Pyramid Network for multi-scale feature extraction
+class FeaturePyramidNetwork(nn.Module):
+    def __init__(self, in_channels_list, out_channels=256):
+        super().__init__()
+        self.inner_blocks = nn.ModuleList()
+        self.layer_blocks = nn.ModuleList()
+        
+        for in_channels in in_channels_list:
+            inner_block = nn.Conv2d(in_channels, out_channels, 1)
+            layer_block = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+            self.inner_blocks.append(inner_block)
+            self.layer_blocks.append(layer_block)
+    
+    def forward(self, x):
+        # x is a list of feature maps from different scales
+        last_inner = self.inner_blocks[-1](x[-1])
+        results = []
+        results.append(self.layer_blocks[-1](last_inner))
+        
+        for i in range(len(x) - 2, -1, -1):
+            inner_lateral = self.inner_blocks[i](x[i])
+            feat_shape = inner_lateral.shape[-2:]
+            inner_top_down = F.interpolate(last_inner, size=feat_shape, mode='nearest')
+            last_inner = inner_lateral + inner_top_down
+            results.insert(0, self.layer_blocks[i](last_inner))
+        
+        return results
+
+# Enhanced attention with channel and spatial attention
+class ChannelSpatialAttention(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.channels = channels
+        
+        # Channel attention
+        self.channel_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1),
+            nn.Sigmoid()
+        )
+        
+        # Spatial attention
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(2, 1, 7, padding=3),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        # Channel attention
+        ca_weights = self.channel_attention(x)
+        x = x * ca_weights
+        
+        # Spatial attention
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        spatial_input = torch.cat([avg_out, max_out], dim=1)
+        sa_weights = self.spatial_attention(spatial_input)
+        x = x * sa_weights
+        
+        return x
 
 # ResNet-style Block for the hybrid architecture
 class ResNetBlock(nn.Module):
@@ -376,10 +523,16 @@ class ResNetUNet(nn.Module):
         return self.outc(x)
 
 class DiffusionModel:
-    def __init__(self, device="cuda" if torch.cuda.is_available() else "cpu", use_metadata=True, dropout_rate=0.1):
+    def __init__(self, device="cuda" if torch.cuda.is_available() else "cpu", use_metadata=True, dropout_rate=0.1, 
+                 use_enhanced_loss=True, beta_schedule='cosine'):
         self.device = device
         self.use_metadata = use_metadata
         self.model = ResNetUNet(use_metadata=use_metadata, dropout_rate=dropout_rate).to(device)
+        
+        # Initialize enhanced loss function
+        self.use_enhanced_loss = use_enhanced_loss
+        if use_enhanced_loss:
+            self.enhanced_loss = EnhancedLoss(device=device)
         
         # Define diffusion hyperparameters
         self.num_timesteps = 1000
@@ -387,7 +540,23 @@ class DiffusionModel:
         self.beta_end = 0.02
         
         # Create beta schedule
-        self.betas = torch.linspace(self.beta_start, self.beta_end, self.num_timesteps).to(device)
+        if beta_schedule == 'cosine':
+            self.betas = self._cosine_beta_schedule(self.num_timesteps).to(device)
+        elif beta_schedule == 'linear':
+            self.betas = torch.linspace(self.beta_start, self.beta_end, self.num_timesteps).to(device)
+        else:
+            raise ValueError(f"Unknown beta schedule: {beta_schedule}")
+    
+    def _cosine_beta_schedule(self, timesteps, s=0.008):
+        """
+        Cosine schedule as proposed in https://arxiv.org/abs/2102.09672
+        """
+        steps = timesteps + 1
+        x = torch.linspace(0, timesteps, steps)
+        alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        return torch.clip(betas, 0.0001, 0.9999)
         self.alphas = 1. - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
         self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0)
@@ -636,8 +805,27 @@ class DiffusionModel:
             # Forward pass
             predicted_noise = self.model(noisy_images, key, t, None, metadata)
             
-            # Calculate loss (mean squared error)
-            loss = F.mse_loss(predicted_noise, target_noise)
+            # Calculate loss
+            if self.use_enhanced_loss:
+                # For enhanced loss, we need to compute the predicted clean image
+                # Using the DDPM reverse process formula
+                sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod[t].view(-1, 1, 1, 1)
+                sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
+                
+                # Predicted clean image
+                pred_clean_image = (noisy_images - sqrt_one_minus_alphas_cumprod_t * predicted_noise) / sqrt_alphas_cumprod_t
+                pred_clean_image = torch.clamp(pred_clean_image, -1, 1)
+                
+                # Apply mask to get target clean image
+                if mask is not None:
+                    target_clean_image = image * (1 - mask) + image * mask
+                else:
+                    target_clean_image = image
+                
+                loss = self.enhanced_loss(predicted_noise, target_noise, pred_clean_image, target_clean_image)
+            else:
+                # Standard MSE loss
+                loss = F.mse_loss(predicted_noise, target_noise)
             
             # Backward pass and optimizer step
             loss.backward()
